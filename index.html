@@ -483,6 +483,7 @@ html[data-fo-locked], html[data-fo-locked] body { overflow: hidden; }
       <div class="fo-controls">
         <button type="button" class="fo-btn" data-fo-act="play" aria-pressed="true">Pause</button>
         <button type="button" class="fo-btn" data-fo-act="flight">Flight: autopilot</button>
+        <button type="button" class="fo-btn" data-fo-act="engineoff">Engine off</button>
         <button type="button" class="fo-btn" data-fo-act="replay">Replay</button>
 <button type="button" class="fo-btn fo-btn-quiet" data-fo-act="clip">Watch the recorded clip</button>      </div>
       <div class="fo-pad" data-fo-pad hidden role="group" aria-label="Stick: hold to fly (arrow keys or WASD also work)">
@@ -1449,7 +1450,34 @@ function verticalOk(c, duration, zGate, maxAccel) {
   return true;
 }
 
-/* DescentReference.from_state: { cx, cz, t_x, t_z, x_pad, z_gate, v_td }. `replan` (an
+/* How many 10% stretches of its horizontal leg a hand-back may take to reach the pad before
+   it diverts instead (lander.py PAD_STRETCHES). */
+const PAD_STRETCHES = 40;
+
+/* _enough_to_hover: whether the propellant lasts `duration` seconds of hovering. */
+function enoughToHover(s0, p, duration) {
+  const m0 = s0[6];
+  const used = m0 * (1.0 - Math.exp((-p.g * duration) / exhaustVelocity(p)));
+  return used <= m0 - p.m_dry;
+}
+
+/* _vertical_leg: a re-plan's vertical quintic to the gate ending at vEnd (down positive),
+   the launch rule's duration stretched 10% at a time (up to 40) until it is feasible. */
+function verticalLeg(z0, zd0, zGate, vEnd, maxAccel, h, o) {
+  const tz = h / Math.max(0.5 * (-zd0 + o.v_td), o.min_mean_speed);
+  const cz = quinticCoefficients(z0, zd0, zGate, -vEnd, tz);
+  if (!verticalOk(cz, tz, zGate, maxAccel)) {
+    let stretched = tz;
+    for (let i = 0; i < 40; i++) {
+      stretched = stretched * 1.1;
+      const trial = quinticCoefficients(z0, zd0, zGate, -vEnd, stretched);
+      if (verticalOk(trial, stretched, zGate, maxAccel)) return [stretched, trial];
+    }
+  }
+  return [tz, cz];
+}
+
+/* DescentReference.from_state: { cx, cz, t_x, t_z, x_pad, z_gate, v_td, hold }. `replan` (an
    autopilot engaged mid-flight) turns on the feasibility guards; a launch plan skips them. */
 function descentReference(s0, p, xPad, opts, replan) {
   const o = Object.assign({}, REFERENCE_DEFAULTS, opts || {});
@@ -1461,7 +1489,7 @@ function descentReference(s0, p, xPad, opts, replan) {
   const h = z0 - zGate;
   if (h <= 0.0) {
     // below the gate: hold the downrange position and descend at v_td from here
-    return { cx: [x0, 0, 0, 0, 0, 0], cz: [z0, 0, 0, 0, 0, 0], t_x: 0.0, t_z: 0.0, x_pad: x0, z_gate: z0, v_td: o.v_td };
+    return { cx: [x0, 0, 0, 0, 0, 0], cz: [z0, 0, 0, 0, 0, 0], t_x: 0.0, t_z: 0.0, x_pad: x0, z_gate: z0, v_td: o.v_td, hold: 0.0 };
   }
   let tz = h / Math.max(0.5 * (-zd0 + o.v_td), o.min_mean_speed);
   let cz = quinticCoefficients(z0, zd0, zGate, -o.v_td, tz);
@@ -1478,10 +1506,29 @@ function descentReference(s0, p, xPad, opts, replan) {
   const toward = xd0 * (dx < 0 ? -1.0 : 1.0); // math.copysign(1.0, dx)
   if (dx !== 0.0 && toward > 0.0) tx = Math.min(tx, Math.max((2.0 * Math.abs(dx)) / toward, o.min_horizontal_time));
   let target = xPad;
+  let hold = 0.0;
   let cx = quinticCoefficients(x0, xd0, target, 0.0, tx);
   if (replan && peakAcceleration(cx, tx) > o.max_accel_x) {
     tx = o.horizontal_fraction * tz;
     cx = quinticCoefficients(x0, xd0, target, 0.0, tx);
+    // still too much: more time for the horizontal leg, hovering at the gate if it outlasts
+    // the descent; divert only if no stretch reaches the pad
+    let reach = tx;
+    for (let i = 0; i < PAD_STRETCHES; i++) {
+      if (peakAcceleration(cx, tx) <= o.max_accel_x) break;
+      reach = reach * 1.1;
+      const trial = quinticCoefficients(x0, xd0, target, 0.0, reach);
+      if (peakAcceleration(trial, reach) <= o.max_accel_x) { tx = reach; cx = trial; }
+    }
+    if (peakAcceleration(cx, tx) <= o.max_accel_x && tx > tz && !enoughToHover(s0, p, tx + o.gate_height / o.v_td)) {
+      // the propellant would run out first: divert (below) instead
+      tx = o.horizontal_fraction * tz;
+      cx = quinticCoefficients(x0, xd0, target, 0.0, tx);
+    }
+    if (peakAcceleration(cx, tx) <= o.max_accel_x && tx > tz) {
+      [tz, cz] = verticalLeg(z0, zd0, zGate, 0.0, o.max_accel_z, h, o);
+      hold = Math.max(tx - tz, 0.0);
+    }
     if (peakAcceleration(cx, tx) > o.max_accel_x) {
       const xStop = x0 + (xd0 * tx) / 2.0;
       let lo = 0.0;
@@ -1496,7 +1543,7 @@ function descentReference(s0, p, xPad, opts, replan) {
       cx = quinticCoefficients(x0, xd0, target, 0.0, tx);
     }
   }
-  return { cx, cz, t_x: tx, t_z: tz, x_pad: target, z_gate: zGate, v_td: o.v_td };
+  return { cx, cz, t_x: tx, t_z: tz, x_pad: target, z_gate: zGate, v_td: o.v_td, hold };
 }
 
 /* The reference's desired [x, z], velocity and acceleration at time t. */
@@ -1506,7 +1553,8 @@ function referenceAt(ref, t) {
   if (t < ref.t_x) x = quinticEval(ref.cx, t);
   else x = [ref.x_pad, 0.0, 0.0];
   if (t < ref.t_z) z = quinticEval(ref.cz, t);
-  else z = [ref.z_gate - ref.v_td * (t - ref.t_z), -ref.v_td, 0.0];
+  else if (t < ref.t_z + ref.hold) z = [ref.z_gate, 0.0, 0.0]; // hovering at the gate
+  else z = [ref.z_gate - ref.v_td * (t - ref.t_z - ref.hold), -ref.v_td, 0.0];
   return { q: [x[0], z[0]], qd: [x[1], z[1]], qdd: [x[2], z[2]] };
 }
 
@@ -3225,7 +3273,9 @@ function foMountGrid(root, spec) {
    - you fly: the visitor holds the stick (throttle and tilt, keyboard or on-screen pad).
      The keys belong to the flight only while it is on: "Exit flight" or Esc hands them
      back to the page, and "Full screen" (automatic on touch screens) fills the window with
-     the scene and two thumb pads (Rodrigo, 2026-10-18).
+     the scene and two thumb pads (Rodrigo, 2026-10-18). A hand-flown lander that leaves
+     the view is lost: it blows up at the edge it crossed. The flight button switches
+     between the autopilot and you fly; Engine off is its own button.
 
    The first two are computed up front with sims/lander.js runLanderScenario on the lanes
    Python builds, so their replays are exactly the runs the parity tests check against
@@ -3299,6 +3349,7 @@ function foMountLander(root, spec) {
   const status = root.querySelector('[data-fo-status]');
   const toggle = root.querySelector('[data-fo-act="flight"]');
   const replay = root.querySelector('[data-fo-act="replay"]');
+  const engineBtn = root.querySelector('[data-fo-act="engineoff"]');
   const pad = root.querySelector('[data-fo-pad]');
   const autoBtn = root.querySelector('[data-fo-act="autopilot"]');
   const fullBtn = root.querySelector('[data-fo-act="full"]');
@@ -3331,7 +3382,7 @@ function foMountLander(root, spec) {
   const xLo = Math.min(...xs);
   const xHi = Math.max(...xs);
   const keys = { up: false, down: false, left: false, right: false };
-  const state = { which: 0, t: 0, hold: 0, boom: 0, acc: 0, manual: null };
+  const state = { which: 0, t: 0, hold: 0, boom: 0, acc: 0, manual: null, view: null };
 
   /* A fresh hand-flown flight from the autopilot lane's start, the stick in the visitor's
      hands from sample 0. */
@@ -3382,6 +3433,7 @@ function foMountLander(root, spec) {
     for (const k of Object.keys(keys)) keys[k] = false;
     toggle.setAttribute('aria-pressed', state.which === 0 ? 'true' : 'false');
     toggle.textContent = FO_LD_LABELS[state.which];
+    if (engineBtn) engineBtn.setAttribute('aria-pressed', state.which === 1 ? 'true' : 'false');
     replay.textContent = state.which === 2 ? 'Fly again' : 'Replay';
     if (pad) pad.hidden = state.which !== 2;
     root.toggleAttribute('data-fo-flying', state.which === 2);
@@ -3443,13 +3495,25 @@ function foMountLander(root, spec) {
     } else if (run.done()) {
       f.outcome = 'lost';
       f.tEnd = run.t;
+    } else if (!f.auto && outOfView(run.x)) {
+      // flown off the drawing by hand: lost, and it blows up where it crossed the edge (the
+      // autopilot may swing wide while it turns back to the pad; it is drawn at the edge)
+      f.outcome = 'out';
+      f.tEnd = run.t;
+      f.exit = { x: Math.min(state.view.xMax, Math.max(state.view.xMin, run.x[0])), z: Math.min(state.view.zTop, run.x[1]) };
     }
+  }
+
+  /* Whether a state is outside what the scene shows (set by drawScene each frame). */
+  function outOfView(x) {
+    const v = state.view;
+    return !!v && (x[0] < v.xMin || x[0] > v.xMax || x[1] > v.zTop);
   }
 
   function step(seconds) {
     const f = flight();
     if (ended(f)) {
-      if (f.outcome === 'crash') state.boom += seconds;
+      if (f.outcome === 'crash' || f.outcome === 'out') state.boom += seconds;
       state.hold += seconds;
       // replays loop; the visitor's own flight waits for "Fly again"
       if (!f.live && state.hold > (f.outcome === 'crash' ? FO_LD_HOLD_CRASH : FO_LD_HOLD)) restart();
@@ -3479,6 +3543,11 @@ function foMountLander(root, spec) {
       else if (f.outcome === 'hard') status.textContent = `Hard landing at ${td.t.toFixed(1)} s: ${speeds}. Safe needs under 2 m/s down, 1 m/s across and 10° tilt.`;
       else if (f.live) status.textContent = `Crash at ${td.t.toFixed(1)} s, ${Math.abs(td.z_dot).toFixed(1)} m/s down. Press Fly again to retry.`;
       else status.textContent = `Impact at ${td.t.toFixed(1)} s at ${Math.abs(td.z_dot).toFixed(1)} m/s down. Without the engine the lander crashes.`;
+      return;
+    }
+    if (f.live && f.outcome === 'out') {
+      status.dataset.verdict = 'unsafe';
+      status.textContent = `Lost at ${f.tEnd.toFixed(1)} s: the lander flew out of the area. Press Fly again to retry.`;
       return;
     }
     if (f.live && f.outcome === 'lost') {
@@ -3513,6 +3582,7 @@ function foMountLander(root, spec) {
     const midX = (xLo + xHi) / 2;
     const X = (x) => w / 2 + (x - midX) * scale;
     const Z = (z) => bottom - z * scale;
+    state.view = { xMin: midX - w / 2 / scale, xMax: midX + w / 2 / scale, zTop: bottom / scale };
     // ground and pad
     ctx.fillStyle = c.grid;
     ctx.fillRect(0, bottom, w, h - bottom);
@@ -3559,6 +3629,7 @@ function foMountLander(root, spec) {
     const k = scale * spec.vehicle_scale;
     const crashed = ended(f) && f.outcome === 'crash';
     if (crashed) drawBoom(ctx, c, X(s[0]), bottom, k, w, h);
+    else if (ended(f) && f.outcome === 'out') drawBoom(ctx, c, X(f.exit.x), Math.max(top, Z(f.exit.z)), k, w, h);
     else drawVehicle(ctx, c, f, i, s, k, X, Z, w);
     if (f.live) drawThrottle(ctx, c, f, w, top, bottom);
     ctx.font = FO_MONO;
@@ -3824,12 +3895,20 @@ function foMountLander(root, spec) {
     toggle.focus();
   }
   toggle.addEventListener('click', () => {
-    state.which = (state.which + 1) % 3;
+    state.which = state.which === 2 ? 0 : 2; // autopilot <-> you fly
     restart();
     if (state.which !== 2) setFull(false);
     else if (touch) setFull(true);
     draw();
   });
+  if (engineBtn) {
+    engineBtn.addEventListener('click', () => {
+      state.which = state.which === 1 ? 0 : 1;
+      setFull(false);
+      restart();
+      draw();
+    });
+  }
   if (fullBtn) fullBtn.addEventListener('click', () => setFull(!root.hasAttribute('data-fo-full')));
   if (exitBtn) exitBtn.addEventListener('click', exitFlight);
   if (autoBtn) autoBtn.addEventListener('click', () => { setAuto(!(state.manual && state.manual.auto)); draw(); });
